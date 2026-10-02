@@ -20,7 +20,7 @@ use biliup::uploader::line::{Line, Probe, StreamParcel, UploadedStream};
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, line};
 use bytes::Bytes;
-use error_stack::ResultExt;
+use error_stack::{Report, ResultExt};
 use futures::Stream;
 use futures::StreamExt;
 use futures::stream::Inspect;
@@ -64,40 +64,109 @@ where
     let upload_context =
         initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
 
-    // 2. 流水线处理视频上传（segment_processor 在每段上传前执行；用于 Remux 等
-    // 在原地改写路径的预处理）
-    let segment_processors: Vec<HookStep> = ctx
-        .live_streamer()
-        .segment_processor
-        .clone()
-        .unwrap_or_default();
-    let uploaded_videos = pipeline_upload_videos(rx, &segment_processors, |path| {
-        upload_owned_file(path, &upload_context)
-    })
-    .await?;
-
-    // 3. 提交到B站
-    if !uploaded_videos.videos.is_empty() {
-        let mut recorder = ctx.recorder(ctx.streamer_info().clone()).clone();
-        recorder.filename_prefix = upload_config.title.clone();
-
-        let studio = build_studio(
-            &upload_config,
-            &upload_context.bilibili,
-            uploaded_videos.videos,
-            &recorder,
-        )
-        .await?;
-        let submit_api = ctx.config().submit_api.clone();
-        submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+    // 断流小文件先留在磁盘上。满 2GB 或满 2 小时就合成 1 个 P 马上投稿，直播继续录。
+    // 下播（这段事件流结束）时，杯子里剩下的也投稿。
+    let mut cup: Vec<SegmentInfo> = Vec::new();
+    let mut cup_bytes: u64 = 0;
+    let mut cup_secs: f64 = 0.0;
+    pin!(rx);
+    while let Some(event) = rx.next().await {
+        cup_bytes = cup_bytes.saturating_add(segment_size_bytes(&event));
+        cup_secs += event.duration_secs.unwrap_or(0.0);
+        cup.push(event);
+        if cup_bytes >= CUP_BYTES || cup_secs >= CUP_SECS {
+            flush_cup(&mut cup, ctx, upload_config, &upload_context).await?;
+            cup_bytes = 0;
+            cup_secs = 0.0;
+        }
     }
-
-    // 4. 执行后处理
-    if !uploaded_videos.paths.is_empty() {
-        execute_postprocessor(uploaded_videos.paths, ctx).await?;
+    if !cup.is_empty() {
+        flush_cup(&mut cup, ctx, upload_config, &upload_context).await?;
     }
 
     Ok(())
+}
+
+const CUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const CUP_SECS: f64 = 2.0 * 60.0 * 60.0;
+
+fn segment_size_bytes(event: &SegmentInfo) -> u64 {
+    if let Some(size) = event.size_bytes {
+        return size;
+    }
+    std::fs::metadata(&event.prev_file_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+}
+
+async fn flush_cup(
+    cup: &mut Vec<SegmentInfo>,
+    ctx: &Context,
+    upload_config: &UploadStreamer,
+    upload_context: &UploadContext,
+) -> AppResult<()> {
+    let events: Vec<SegmentInfo> = cup.drain(..).collect();
+    if events.is_empty() {
+        return Ok(());
+    }
+    let merged = merge_cup(&events).await?;
+    let video = upload_owned_file(merged.clone(), upload_context).await?;
+    let mut recorder = ctx.recorder(ctx.streamer_info().clone()).clone();
+    recorder.filename_prefix = upload_config.title.clone();
+    let studio = build_studio(
+        upload_config,
+        &upload_context.bilibili,
+        vec![video],
+        &recorder,
+    )
+    .await?;
+    let submit_api = ctx.config().submit_api.clone();
+    submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+    let mut paths: Vec<PathBuf> = events
+        .iter()
+        .map(|event| event.prev_file_path.clone())
+        .collect();
+    if paths.first() != Some(&merged) {
+        paths.push(merged);
+    }
+    execute_postprocessor(paths, ctx).await?;
+    Ok(())
+}
+
+async fn merge_cup(events: &[SegmentInfo]) -> AppResult<PathBuf> {
+    if events.len() == 1 {
+        return Ok(events[0].prev_file_path.clone());
+    }
+    let first = &events[0].prev_file_path;
+    let parent = first.parent().unwrap_or_else(|| Path::new("."));
+    let stem = first
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cup");
+    let output = parent.join(format!("{stem}-合并.mp4"));
+    let list_path = parent.join(format!("{stem}-合并.txt"));
+    let mut list = String::new();
+    for event in events {
+        let path = event
+            .prev_file_path
+            .to_string_lossy()
+            .replace('\'', "'\\''");
+        list.push_str(&format!("file '{path}'\n"));
+    }
+    std::fs::write(&list_path, list).change_context_lazy(|| AppError::Unknown)?;
+    let status = tokio::process::Command::new("ffmpeg")
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list_path)
+        .args(["-c", "copy"])
+        .arg(&output)
+        .status()
+        .await
+        .change_context_lazy(|| AppError::Custom("找不到 ffmpeg".into()))?;
+    let _ = std::fs::remove_file(&list_path);
+    if !status.success() {
+        return Err(Report::new(AppError::Custom("ffmpeg 合并这一杯失败".into())));
+    }
+    Ok(output)
 }
 
 async fn process_without_upload<F>(
