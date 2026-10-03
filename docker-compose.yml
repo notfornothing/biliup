@@ -1,6 +1,6 @@
 services:
   biliup:
-    image: ghcr.io/biliup/caution:latest
+    image: notfornothing/biliup:dev
     container_name: biliup
     restart: unless-stopped
     ports:

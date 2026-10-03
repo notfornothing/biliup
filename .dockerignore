@@ -17,6 +17,10 @@ data
 *.sqlite3-*
 cookies.json
 *.log
+*.flv
+*.mp4
+*.part
+*.m4s
 .env.local
 .env.*.local
 

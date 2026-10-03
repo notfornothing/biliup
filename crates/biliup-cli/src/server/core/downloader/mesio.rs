@@ -89,7 +89,7 @@ impl Mesio {
         let base = DownloaderConfig::builder()
             .with_headers(headers)
             .with_caching_enabled(false)
-            .with_system_proxy(true)
+            .with_system_proxy(false)
             .build();
         let flv_config = FlvProtocolConfig::builder()
             .with_base_config(base.clone())

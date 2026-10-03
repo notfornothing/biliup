@@ -74,7 +74,7 @@ impl ReqwestClientBuilderExt for reqwest::Client {
                 tracing::debug!("使用代理: {}", proxy.as_str());
                 Self::builder().proxy(reqwest::Proxy::all(proxy).unwrap())
             }
-            None => Self::builder(),
+            None => Self::builder().no_proxy(),
         }
     }
 }

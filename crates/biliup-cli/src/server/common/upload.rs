@@ -64,7 +64,7 @@ where
     let upload_context =
         initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
 
-    // 断流小文件先留在磁盘上。满 2GB 或满 2 小时就合成 1 个 P 马上投稿，直播继续录。
+    // 断流小文件先留在磁盘上。满 10GB 或满 2 小时就合成 1 个 P 马上投稿，直播继续录。
     // 下播（这段事件流结束）时，杯子里剩下的也投稿。
     let mut cup: Vec<SegmentInfo> = Vec::new();
     let mut cup_bytes: u64 = 0;
@@ -87,7 +87,7 @@ where
     Ok(())
 }
 
-const CUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const CUP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const CUP_SECS: f64 = 2.0 * 60.0 * 60.0;
 
 fn segment_size_bytes(event: &SegmentInfo) -> u64 {
