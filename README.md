@@ -1,3 +1,51 @@
+# biliup（个人 fork）
+
+基于 [biliup/biliup](https://github.com/biliup/biliup)。这份是自己的录播投稿版本。
+
+公开镜像：https://hub.docker.com/r/notfornothing/biliup
+
+## 和官方镜像的差别
+
+* 断流小文件先留在磁盘上。满 **10GB** 或满 **2 小时**（先到哪条算哪条）用 FFmpeg 合成 **1 个分 P** 再投稿，直播继续录。下播时杯子没满，剩下的也投稿。这条规则写死在程序里，不是页面配置，也不是外面挂的脚本。
+* 拉流和投稿不走系统代理。
+* 页面上仍可配的处理（编辑直播间 → 展开更多，超级管理员）：下载前处理、分段时后处理、下载后处理、后处理（`rm` 删除、`mv` 移动、`run` 命令、webhook）。这些只作用于已经切好的单个文件，不能配置「10GB / 2 小时」这条线。
+
+更细的配置笔记在 `aboutRefactor/README.md`，杯子示意图在 `aboutRefactor/分P示意图.md`。
+
+## docker compose
+
+```yaml
+services:
+  biliup:
+    image: notfornothing/biliup:dev
+    ports:
+      - "19159:19159"
+    volumes:
+      - ./data:/opt
+    command: server --bind 0.0.0.0 --auth
+```
+
+```bash
+docker compose up -d
+```
+
+浏览器打开 http://127.0.0.1:19159 。第一次要设管理员密码，用户名是 `biliup`。
+
+录像、登录和数据库都在挂载的 `./data` 里。数据库是文件 `./data/data/data.sqlite3`，没有单独的数据库端口，不能从外面用地址去连。
+
+## 本地构建
+
+在仓库根目录：
+
+```bash
+docker build -t notfornothing/biliup:dev .
+docker compose up -d
+```
+
+---
+
+以下为上游 README。
+
 <div align="center">
   <img src="https://raw.githubusercontent.com/biliup/biliup/master/public/logo.png" alt="biliup" width="300" height="300"/>
 </div>
