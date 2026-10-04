@@ -10,4 +10,4 @@ services:
       # 录播与数据保存目录，默认使用当前目录下的 data/
       - ${BILIUP_DATA:-./data}:/opt
     # 容器内必须监听 0.0.0.0，否则上面的端口映射无法转发进容器
-    command: server --bind 0.0.0.0 --auth
+    command: server --bind 0.0.0.0 --auth --secure-session-cookie

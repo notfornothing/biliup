@@ -12,7 +12,7 @@ use crate::server::infrastructure::models::hook_step::{
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use crate::server::workbench::retention::Retention;
 use async_channel::Receiver;
-use biliup::bilibili::{BiliBili, Credit, ResponseData, Studio, Video};
+use biliup::bilibili::{BiliBili, Credit, ResponseData, Studio, Vid, Video};
 use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
@@ -64,30 +64,41 @@ where
     let upload_context =
         initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
 
-    // 断流小文件先留在磁盘上。满 10GB 或满 2 小时就合成 1 个 P 马上投稿，直播继续录。
+    // 断流小文件先留在磁盘上。满 30GB 或满 2 小时就合成 1 个 P 马上投稿，直播继续录。
     // 下播（这段事件流结束）时，杯子里剩下的也投稿。
     let mut cup: Vec<SegmentInfo> = Vec::new();
     let mut cup_bytes: u64 = 0;
     let mut cup_secs: f64 = 0.0;
+    let mut archive: Option<String> = None;
     pin!(rx);
     while let Some(event) = rx.next().await {
         cup_bytes = cup_bytes.saturating_add(segment_size_bytes(&event));
         cup_secs += event.duration_secs.unwrap_or(0.0);
         cup.push(event);
         if cup_bytes >= CUP_BYTES || cup_secs >= CUP_SECS {
-            flush_cup(&mut cup, ctx, upload_config, &upload_context).await?;
+            archive = Some(
+                flush_cup(&mut cup, ctx, upload_config, &upload_context, archive.as_deref())
+                    .await?,
+            );
             cup_bytes = 0;
             cup_secs = 0.0;
         }
     }
     if !cup.is_empty() {
-        flush_cup(&mut cup, ctx, upload_config, &upload_context).await?;
+        flush_cup(
+            &mut cup,
+            ctx,
+            upload_config,
+            &upload_context,
+            archive.as_deref(),
+        )
+        .await?;
     }
 
     Ok(())
 }
 
-const CUP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const CUP_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 const CUP_SECS: f64 = 2.0 * 60.0 * 60.0;
 
 fn segment_size_bytes(event: &SegmentInfo) -> u64 {
@@ -104,24 +115,39 @@ async fn flush_cup(
     ctx: &Context,
     upload_config: &UploadStreamer,
     upload_context: &UploadContext,
-) -> AppResult<()> {
+    archive: Option<&str>,
+) -> AppResult<String> {
     let events: Vec<SegmentInfo> = cup.drain(..).collect();
     if events.is_empty() {
-        return Ok(());
+        return Err(Report::new(AppError::Custom("空杯子不能投稿".into())));
     }
     let merged = merge_cup(&events).await?;
     let video = upload_owned_file(merged.clone(), upload_context).await?;
-    let mut recorder = ctx.recorder(ctx.streamer_info().clone()).clone();
-    recorder.filename_prefix = upload_config.title.clone();
-    let studio = build_studio(
-        upload_config,
-        &upload_context.bilibili,
-        vec![video],
-        &recorder,
-    )
-    .await?;
     let submit_api = ctx.config().submit_api.clone();
-    submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+    let bvid = if let Some(bvid) = archive {
+        let mut studio = upload_context
+            .bilibili
+            .studio_data(&Vid::Bvid(bvid.to_string()), None)
+            .await
+            .change_context(AppError::Unknown)?;
+        studio.videos.push(video);
+        edit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+        info!(bvid, "追加为一个分 P");
+        bvid.to_string()
+    } else {
+        let mut recorder = ctx.recorder(ctx.streamer_info().clone()).clone();
+        recorder.filename_prefix = upload_config.title.clone();
+        let studio = build_studio(
+            upload_config,
+            &upload_context.bilibili,
+            vec![video],
+            &recorder,
+        )
+        .await?;
+        let ret = submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref())
+            .await?;
+        bvid_from_submit(&ret)?
+    };
     let mut paths: Vec<PathBuf> = events
         .iter()
         .map(|event| event.prev_file_path.clone())
@@ -130,7 +156,7 @@ async fn flush_cup(
         paths.push(merged);
     }
     execute_postprocessor(paths, ctx).await?;
-    Ok(())
+    Ok(bvid)
 }
 
 async fn merge_cup(events: &[SegmentInfo]) -> AppResult<PathBuf> {
@@ -433,6 +459,16 @@ pub(crate) fn aid_from_submit(ret: &ResponseData) -> AppResult<u64> {
         .and_then(|v| v.get("aid"))
         .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
         .ok_or_else(|| AppError::Custom("投稿成功但未返回 aid".into()).into())
+}
+
+fn bvid_from_submit(ret: &ResponseData) -> AppResult<String> {
+    ret.data
+        .as_ref()
+        .and_then(|v| v.get("bvid"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| AppError::Custom("投稿成功但未返回 bvid".into()).into())
 }
 
 /// 边录边传：把内存分片流上传到 UPOS。上传并发固定为 3，对齐原 sync-downloader。
