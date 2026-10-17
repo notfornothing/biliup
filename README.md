@@ -17,7 +17,7 @@
 ```yaml
 services:
   biliup:
-    image: notfornothing/biliup:dev
+    image: notfornothing/biliup:master
     ports:
       - "19159:19159"
     volumes:
@@ -38,7 +38,7 @@ docker compose up -d
 在仓库根目录：
 
 ```bash
-docker build -t notfornothing/biliup:dev .
+docker build -t notfornothing/biliup:master .
 docker compose up -d
 ```
 

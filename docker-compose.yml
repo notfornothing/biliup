@@ -1,6 +1,6 @@
 services:
   biliup:
-    image: notfornothing/biliup:dev
+    image: notfornothing/biliup:master
     container_name: biliup
     restart: unless-stopped
     ports:
