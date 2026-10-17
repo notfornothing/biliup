@@ -4,8 +4,6 @@ import { Form, Modal, Toast, Typography } from '@douyinfe/semi-ui'
 import type { FormApi } from '@douyinfe/semi-ui/lib/es/form'
 import { API_BASE } from '../lib/api-streamer'
 
-export const MIN_PASSWORD_LENGTH = 8
-
 type Values = { old_password: string; new_password: string; confirm: string }
 
 /** 修改自己的密码。成功后当前浏览器保持登录，其它设备上的会话全部失效。 */
@@ -83,14 +81,7 @@ export default function ChangePasswordModal({
           label="新密码"
           mode="password"
           autoComplete="new-password"
-          rules={[
-            { required: true, message: '请输入新密码' },
-            {
-              validator: (_rule: unknown, value: string) =>
-                new TextEncoder().encode(value ?? '').length >= MIN_PASSWORD_LENGTH,
-              message: `至少 ${MIN_PASSWORD_LENGTH} 个字符`,
-            },
-          ]}
+          rules={[{ required: true, message: '请输入新密码' }]}
         />
         <Form.Input
           field="confirm"

@@ -14,7 +14,6 @@ use tokio::task;
 const MAX_CONCURRENT_PASSWORD_TASKS: usize = 4;
 static PASSWORD_TASKS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-pub const MIN_PASSWORD_BYTES: usize = 1;
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 pub const MAX_USERNAME_CHARS: usize = 32;
 
@@ -72,8 +71,8 @@ pub fn validate_username(username: &str) -> Result<(), &'static str> {
 }
 
 pub fn validate_new_password(password: &str) -> Result<(), &'static str> {
-    if password.len() < MIN_PASSWORD_BYTES || password.len() > MAX_PASSWORD_BYTES {
-        return Err("密码须为 1 至 1024 字节");
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err("密码不能超过 1024 字节");
     }
     Ok(())
 }
@@ -723,12 +722,6 @@ mod tests {
     async fn administrator_bootstrap_is_one_time_and_passwords_are_checked() {
         let (_dir, backend) = backend().await;
 
-        assert!(matches!(
-            backend
-                .bootstrap_admin(credentials("biliup", "short"))
-                .await,
-            Err(CreateUserError::Invalid(_))
-        ));
         assert!(matches!(
             backend
                 .bootstrap_admin(credentials("biliup", &"x".repeat(1025)))

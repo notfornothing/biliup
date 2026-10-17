@@ -20,7 +20,6 @@ import dc from '@/app/ui/data-card.module.scss'
 import { API_BASE, fetcher, revalidateMe } from '@/app/lib/api-streamer'
 import { PERMISSION_LABELS, ROLE_LABELS, useMe } from '@/app/lib/use-me'
 import type { Permission, Role } from '@/app/lib/use-me'
-import { MIN_PASSWORD_LENGTH } from '@/app/ui/ChangePasswordModal'
 import { humDate } from '@/app/lib/utils'
 import { timeAgo } from '@/app/lib/use-dashboard'
 import { useIsMobile } from '@/app/lib/useIsMobile'
@@ -72,14 +71,7 @@ async function call(method: string, url: string, body?: unknown) {
   return res
 }
 
-const passwordRules = [
-  { required: true, message: '请输入密码' },
-  {
-    validator: (_rule: unknown, value: string) =>
-      new TextEncoder().encode(value ?? '').length >= MIN_PASSWORD_LENGTH,
-    message: `至少 ${MIN_PASSWORD_LENGTH} 个字符`,
-  },
-]
+const passwordRules = [{ required: true, message: '请输入密码' }]
 
 /** 按后端给的权限点描述角色，前端不再手写「哪个角色能做什么」 */
 function describe(permissions: Permission[]) {
