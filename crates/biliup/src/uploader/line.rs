@@ -114,6 +114,15 @@ impl Probe {
     ) -> Result<Line> {
         let mut choice_line: Line = Default::default();
         for mut line in lines {
+            // bldsa / cnbldsa 同一批节点里大约一半仍是 2026-07-11 过期的证书。
+            // 测速碰巧打到好节点就会选中它，上传再打到坏节点就整段失败（biliup#1725）。
+            if line_uses_expired_bldsa(&line) {
+                warn!(
+                    "{} 节点证书不一致（部分已于 2026-07-11 过期），自动选线跳过",
+                    line.query
+                );
+                continue;
+            }
             let instant = Instant::now();
             let request = Probe::ping(probe, &probe_url(&line.probe_url), client)
                 .timeout(per_line_timeout)
@@ -158,6 +167,13 @@ impl Probe {
             client.post(url).body(vec![0; probe_post_bytes(probe)])
         }
     }
+}
+
+/// `upcdn=bldsa` 与 `cnbldsa` 的探测域名都落在 `upcdnbldsa` 上，节点证书新旧混杂。
+fn line_uses_expired_bldsa(line: &Line) -> bool {
+    line.probe_url.contains("upcdnbldsa")
+        || line.query.contains("upcdn=bldsa")
+        || line.query.contains("upcdn=cnbldsa")
 }
 
 /// B 站返回的 `probe_url` 形如 `//host/OK`，需要补上 https；已带协议的地址原样使用。
@@ -588,6 +604,23 @@ mod tests {
         match result {
             Err(Custom(message)) => assert_eq!(message, "所有上传线路测速均失败"),
             other => panic!("期望所有线路失败的统一错误，实际为 {other:?}"),
+        }
+    }
+
+    /// 仅有 bldsa 时不能把它选中：探测域名不会被请求，结果与全部失败相同。
+    #[tokio::test]
+    async fn select_line_skips_bldsa_without_contacting_it() {
+        let client = reqwest::Client::new();
+        let result = Probe::select_line(
+            &client,
+            &serde_json::json!({"get": {}}),
+            vec![bldsa(), cnbldsa()],
+            PROBE_LINE_TIMEOUT,
+        )
+        .await;
+        match result {
+            Err(Custom(message)) => assert_eq!(message, "所有上传线路测速均失败"),
+            other => panic!("期望跳过 bldsa 后没有可用线路，实际为 {other:?}"),
         }
     }
 
