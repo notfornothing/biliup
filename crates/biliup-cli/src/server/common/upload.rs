@@ -64,7 +64,7 @@ where
     let upload_context =
         initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
 
-    // 断流小文件先留在磁盘上。一个分 P 最多 15GB 或 2 小时，先到先合成投稿，直播继续录。
+    // 断流小文件先留在磁盘上。一个分 P 最多 10GB 或 2 小时，先到先合成投稿，直播继续录。
     // 下播（这段事件流结束）时，杯子里剩下的也投稿。
     let mut cup: Vec<SegmentInfo> = Vec::new();
     let mut cup_bytes: u64 = 0;
@@ -100,12 +100,12 @@ where
     Ok(())
 }
 
-/// 一个分 P 的体积硬上限。平台约 16GB，这里留到 15GB（十进制）。
-const CUP_BYTES: u64 = 15 * 1000 * 1000 * 1000;
+/// 一个分 P 的体积硬上限。十进制 10GB，避免单次上传过大中途失败。
+const CUP_BYTES: u64 = 10 * 1000 * 1000 * 1000;
 /// 一个分 P 的时长硬上限。
 const CUP_SECS: f64 = 2.0 * 60.0 * 60.0;
 
-/// 杯子里已经有分段时，再放入这一段会超过 15GB 或 2 小时，就要先封口。
+/// 杯子里已经有分段时，再放入这一段会超过 10GB 或 2 小时，就要先封口。
 /// 空杯子总是收下这一段：单段自己已经超限也只能单独成一个 P。
 fn cup_is_full(cup_bytes: u64, cup_secs: f64, add_bytes: u64, add_secs: f64) -> bool {
     if cup_bytes == 0 && cup_secs == 0.0 {
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn cup_seals_before_crossing_15gb_or_2h() {
+    fn cup_seals_before_crossing_10gb_or_2h() {
         let segment_bytes = 2_621_440_000u64;
         let segment_secs = 20.0 * 60.0;
         let segments = vec![(segment_bytes, segment_secs); 8];
