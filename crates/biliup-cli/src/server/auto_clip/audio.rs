@@ -188,16 +188,18 @@ pub async fn encode_chunk(source: &Path, spans: &[Span], out: &Path) -> Result<u
 /// 按 10 ms 一帧选出区间：先把音频切成每帧 160 个采样，再按帧号选，拼出来的时长与区间表
 /// 逐帧对得上，块内时间换算回段内时间不会随区间数累积误差。
 fn select_filter(spans: &[Span]) -> String {
+    // 逗号在滤镜图里是分隔符。新版 ffmpeg 不再把单引号里的逗号当成表达式的一部分，
+    // aselect 会被拆碎，整段音频原样通过，切块和对半切开都不起作用。
     let terms: Vec<String> = spans
         .iter()
         .map(|span| {
             let first = span.from_ms / FRAME_MS;
             let last = (span.to_ms / FRAME_MS - 1).max(first);
-            format!("between(n,{first},{last})")
+            format!("between(n\\,{first}\\,{last})")
         })
         .collect();
     format!(
-        "asetnsamples=n={FRAME_SAMPLES}:p=0,aselect='{}',asetpts=N/SR/TB",
+        "asetnsamples=n={FRAME_SAMPLES}:p=0,aselect={},asetpts=N/SR/TB",
         terms.join("+")
     )
 }
@@ -479,7 +481,7 @@ size= 1kB time=00:00:30.00
         assert_eq!(to_segment_ms(&spans, 9_999), 11_000, "越界取最后一段的末尾");
         assert_eq!(
             select_filter(&spans),
-            "asetnsamples=n=160:p=0,aselect='between(n,100,299)+between(n,1000,1099)',asetpts=N/SR/TB"
+            "asetnsamples=n=160:p=0,aselect=between(n\\,100\\,299)+between(n\\,1000\\,1099),asetpts=N/SR/TB"
         );
     }
 

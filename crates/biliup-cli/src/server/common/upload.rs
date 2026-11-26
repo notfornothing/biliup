@@ -10,8 +10,8 @@ use crate::server::infrastructure::models::hook_step::{
     HookStep, process_video, process_video_paths,
 };
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
-use crate::server::workbench::retention::Retention;
-use async_channel::Receiver;
+use crate::server::workbench::retention::{self, Retention};
+use async_channel::{Receiver, Sender};
 use biliup::bilibili::{BiliBili, Credit, ResponseData, Studio, Vid, Video};
 use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
@@ -28,7 +28,7 @@ use ormlite::Insert;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::pin;
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
@@ -64,21 +64,25 @@ where
     let upload_context =
         initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
 
-    // 断流小文件先留在磁盘上。一个分 P 最多 10GB 或 2 小时，先到先合成投稿，直播继续录。
-    // 下播（这段事件流结束）时，杯子里剩下的也投稿。
+    // 分段先装杯，不上传。满 2 小时或 10GB 再合并，合并完立刻删源文件。
+    // 合并文件在旁边上传：失败只重试这一杯，后面的杯追加到同一条稿。
+    let (jobs_tx, jobs_rx) = async_channel::unbounded();
+    let upload_task = tokio::spawn(upload_cups(
+        jobs_rx,
+        ctx.clone(),
+        upload_config.clone(),
+        upload_context,
+    ));
+
     let mut cup: Vec<SegmentInfo> = Vec::new();
     let mut cup_bytes: u64 = 0;
     let mut cup_secs: f64 = 0.0;
-    let mut archive: Option<String> = None;
     pin!(rx);
     while let Some(event) = rx.next().await {
         let add_bytes = segment_size_bytes(&event);
         let add_secs = event.duration_secs.unwrap_or(0.0);
         if cup_is_full(cup_bytes, cup_secs, add_bytes, add_secs) {
-            archive = Some(
-                flush_cup(&mut cup, ctx, upload_config, &upload_context, archive.as_deref())
-                    .await?,
-            );
+            seal_cup(&mut cup, ctx, &jobs_tx).await?;
             cup_bytes = 0;
             cup_secs = 0.0;
         }
@@ -87,17 +91,13 @@ where
         cup.push(event);
     }
     if !cup.is_empty() {
-        flush_cup(
-            &mut cup,
-            ctx,
-            upload_config,
-            &upload_context,
-            archive.as_deref(),
-        )
-        .await?;
+        seal_cup(&mut cup, ctx, &jobs_tx).await?;
     }
-
-    Ok(())
+    drop(jobs_tx);
+    match upload_task.await {
+        Ok(result) => result,
+        Err(e) => Err(Report::new(AppError::Custom(format!("上传任务中断: {e}")))),
+    }
 }
 
 /// 一个分 P 的体积硬上限。十进制 10GB，避免单次上传过大中途失败。
@@ -123,21 +123,75 @@ fn segment_size_bytes(event: &SegmentInfo) -> u64 {
         .unwrap_or(0)
 }
 
-async fn flush_cup(
+/// 封口：合成一个文件，多段时立刻删掉源分段，把成品交给上传队列。
+async fn seal_cup(
     cup: &mut Vec<SegmentInfo>,
     ctx: &Context,
-    upload_config: &UploadStreamer,
-    upload_context: &UploadContext,
-    archive: Option<&str>,
-) -> AppResult<String> {
+    jobs: &Sender<PathBuf>,
+) -> AppResult<()> {
     let events: Vec<SegmentInfo> = cup.drain(..).collect();
     if events.is_empty() {
         return Err(Report::new(AppError::Custom("空杯子不能投稿".into())));
     }
     let merged = merge_cup(&events).await?;
-    let video = upload_owned_file(merged.clone(), upload_context).await?;
+    let sources: Vec<PathBuf> = events
+        .iter()
+        .map(|event| event.prev_file_path.clone())
+        .filter(|path| path != &merged)
+        .collect();
+    if !sources.is_empty() {
+        let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
+        let retention = Retention::without_delay(ctx.pool().clone());
+        retention::remove(&retention, &refs)
+            .await
+            .change_context(AppError::Unknown)?;
+    }
+    jobs.send(merged)
+        .await
+        .change_context(AppError::Custom("上传队列已关闭".into()))?;
+    Ok(())
+}
+
+/// 按封口顺序上传。每一杯失败就过一会儿重试，不换稿；第一杯建稿，后面的追加成分 P。
+async fn upload_cups(
+    jobs: Receiver<PathBuf>,
+    ctx: Context,
+    upload_config: UploadStreamer,
+    upload_context: UploadContext,
+) -> AppResult<()> {
+    let mut archive: Option<String> = None;
+    while let Ok(path) = jobs.recv().await {
+        loop {
+            match submit_cup(&path, &ctx, &upload_config, &upload_context, archive.as_deref())
+                .await
+            {
+                Ok(bvid) => {
+                    archive = Some(bvid);
+                    if let Err(e) = execute_postprocessor(vec![path], &ctx).await {
+                        warn!(error = %e, "这一杯已经投稿，删除本地文件失败");
+                    }
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "这一杯上传失败，稍后重试");
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn submit_cup(
+    path: &Path,
+    ctx: &Context,
+    upload_config: &UploadStreamer,
+    upload_context: &UploadContext,
+    archive: Option<&str>,
+) -> AppResult<String> {
+    let video = upload_owned_file(path.to_path_buf(), upload_context).await?;
     let submit_api = ctx.config().submit_api.clone();
-    let bvid = if let Some(bvid) = archive {
+    if let Some(bvid) = archive {
         let mut studio = upload_context
             .bilibili
             .studio_data(&Vid::Bvid(bvid.to_string()), None)
@@ -146,7 +200,7 @@ async fn flush_cup(
         studio.videos.push(video);
         edit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
         info!(bvid, "追加为一个分 P");
-        bvid.to_string()
+        Ok(bvid.to_string())
     } else {
         let mut recorder = ctx.recorder(ctx.streamer_info().clone()).clone();
         recorder.filename_prefix = upload_config.title.clone();
@@ -159,17 +213,8 @@ async fn flush_cup(
         .await?;
         let ret = submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref())
             .await?;
-        bvid_from_submit(&ret)?
-    };
-    let mut paths: Vec<PathBuf> = events
-        .iter()
-        .map(|event| event.prev_file_path.clone())
-        .collect();
-    if paths.first() != Some(&merged) {
-        paths.push(merged);
+        bvid_from_submit(&ret)
     }
-    execute_postprocessor(paths, ctx).await?;
-    Ok(bvid)
 }
 
 async fn merge_cup(events: &[SegmentInfo]) -> AppResult<PathBuf> {
@@ -184,28 +229,72 @@ async fn merge_cup(events: &[SegmentInfo]) -> AppResult<PathBuf> {
         .unwrap_or("cup");
     let output = parent.join(format!("{stem}-合并.mp4"));
     let list_path = parent.join(format!("{stem}-合并.txt"));
-    let mut list = String::new();
-    for event in events {
-        let path = event
-            .prev_file_path
-            .to_string_lossy()
-            .replace('\'', "'\\''");
-        list.push_str(&format!("file '{path}'\n"));
+    let mut ts_paths = Vec::with_capacity(events.len());
+    let merged = async {
+        let mut list = String::new();
+        for (index, event) in events.iter().enumerate() {
+            let ts = parent.join(format!("{stem}-合并-{index}.ts"));
+            remux_to_mpegts(&event.prev_file_path, &ts).await?;
+            let listed = ts.to_string_lossy().replace('\'', "'\\''");
+            list.push_str(&format!("file '{listed}'\n"));
+            ts_paths.push(ts);
+        }
+        std::fs::write(&list_path, list).change_context_lazy(|| AppError::Unknown)?;
+        // 每段录制时间戳都从 0 开始。先转成 MPEG-TS，再用 concat 解复用器按顺序接上，
+        // 封回 mp4 时时间戳是连续的，避免分 P 里出现跳变被 B 站退回。
+        let status = tokio::process::Command::new("ffmpeg")
+            .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+            .arg(&list_path)
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&output)
+            .status()
+            .await
+            .change_context_lazy(|| AppError::Custom("找不到 ffmpeg".into()))?;
+        if !status.success() {
+            return Err(Report::new(AppError::Custom("ffmpeg 合并这一杯失败".into())));
+        }
+        Ok(output)
     }
-    std::fs::write(&list_path, list).change_context_lazy(|| AppError::Unknown)?;
-    let status = tokio::process::Command::new("ffmpeg")
-        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
-        .arg(&list_path)
-        .args(["-c", "copy"])
-        .arg(&output)
-        .status()
-        .await
-        .change_context_lazy(|| AppError::Custom("找不到 ffmpeg".into()))?;
+    .await;
     let _ = std::fs::remove_file(&list_path);
-    if !status.success() {
-        return Err(Report::new(AppError::Custom("ffmpeg 合并这一杯失败".into())));
+    for ts in &ts_paths {
+        let _ = std::fs::remove_file(ts);
     }
-    Ok(output)
+    merged
+}
+
+async fn remux_to_mpegts(input: &Path, ts: &Path) -> AppResult<()> {
+    let ext = input
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let filters: &[&[&str]] = if ext == "mp4" || ext == "m4v" || ext == "m4s" {
+        &[&["-bsf:v", "h264_mp4toannexb"], &["-bsf:v", "hevc_mp4toannexb"], &[]]
+    } else {
+        &[&[]]
+    };
+    let mut last = String::from("ffmpeg 转 mpegts 失败");
+    for extra in filters {
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.arg("-y").arg("-i").arg(input);
+        cmd.args(*extra);
+        cmd.args(["-c", "copy", "-f", "mpegts"]).arg(ts);
+        let status = cmd
+            .status()
+            .await
+            .change_context_lazy(|| AppError::Custom("找不到 ffmpeg".into()))?;
+        if status.success()
+            && std::fs::metadata(ts)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        last = format!("ffmpeg 转 mpegts 退出 {status}");
+        let _ = std::fs::remove_file(ts);
+    }
+    Err(Report::new(AppError::Custom(last)))
 }
 
 async fn process_without_upload<F>(

@@ -6,7 +6,7 @@
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -112,6 +112,7 @@ impl FakeServer {
         let app = Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/v1/audio/transcriptions", post(transcriptions))
+            .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
             .with_state(Shared {
                 scenario,
                 seen: seen.clone(),
