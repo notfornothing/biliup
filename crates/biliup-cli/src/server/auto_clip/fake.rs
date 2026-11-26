@@ -112,7 +112,7 @@ impl FakeServer {
         let app = Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/v1/audio/transcriptions", post(transcriptions))
-            .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+            .layer(DefaultBodyLimit::disable())
             .with_state(Shared {
                 scenario,
                 seen: seen.clone(),

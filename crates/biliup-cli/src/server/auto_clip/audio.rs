@@ -17,9 +17,8 @@ use std::path::Path;
 use std::process::Stdio;
 
 pub const SAMPLE_RATE: u32 = 16_000;
-/// 切块时选取音频的粒度：每帧 160 个采样
+/// 切块时选取音频的粒度
 const FRAME_MS: i64 = 10;
-const FRAME_SAMPLES: i64 = SAMPLE_RATE as i64 * FRAME_MS / 1000;
 /// 能量低于 -35 dB 且持续 2 s 以上算静音。这是能量阈值，不是真正的人声检测：背景音乐、
 /// 游戏音效不会被当成静音。
 const SILENCE_FILTER: &str = "silencedetect=noise=-35dB:d=2";
@@ -166,7 +165,7 @@ pub async fn encode_chunk(source: &Path, spans: &[Span], out: &Path) -> Result<u
             "-i",
         ])
         .arg(source)
-        .args(["-af", &select_filter(spans)])
+        .args(["-filter_complex", &select_filter(spans), "-map", "[out]"])
         .args(["-ac", "1", "-ar", &SAMPLE_RATE.to_string()])
         .args(["-c:a", "flac", "-f", "flac", "-y"])
         .arg(out)
@@ -185,22 +184,35 @@ pub async fn encode_chunk(source: &Path, spans: &[Span], out: &Path) -> Result<u
     Ok(tokio::fs::metadata(out).await?.len())
 }
 
-/// 按 10 ms 一帧选出区间：先把音频切成每帧 160 个采样，再按帧号选，拼出来的时长与区间表
-/// 逐帧对得上，块内时间换算回段内时间不会随区间数累积误差。
+/// 按区间把音频裁出来再接上。用 `atrim` 而不是 `aselect`：新版 ffmpeg 会把 `aselect`
+/// 表达式里的逗号当成滤镜分隔符，整段原样通过，静音切不掉，对半切也不变短。
 fn select_filter(spans: &[Span]) -> String {
-    // 逗号在滤镜图里是分隔符。新版 ffmpeg 不再把单引号里的逗号当成表达式的一部分，
-    // aselect 会被拆碎，整段音频原样通过，切块和对半切开都不起作用。
-    let terms: Vec<String> = spans
+    let secs = |ms: i64| format!("{:.3}", ms as f64 / 1000.0);
+    if spans.len() == 1 {
+        let span = &spans[0];
+        return format!(
+            "[0:a]atrim=start={}:end={},asetpts=PTS-STARTPTS[out]",
+            secs(span.from_ms),
+            secs(span.to_ms)
+        );
+    }
+    let cuts: Vec<String> = spans
         .iter()
-        .map(|span| {
-            let first = span.from_ms / FRAME_MS;
-            let last = (span.to_ms / FRAME_MS - 1).max(first);
-            format!("between(n\\,{first}\\,{last})")
+        .enumerate()
+        .map(|(index, span)| {
+            format!(
+                "[0:a]atrim=start={}:end={},asetpts=PTS-STARTPTS[a{index}]",
+                secs(span.from_ms),
+                secs(span.to_ms)
+            )
         })
         .collect();
+    let inputs: String = (0..spans.len()).map(|index| format!("[a{index}]")).collect();
     format!(
-        "asetnsamples=n={FRAME_SAMPLES}:p=0,aselect={},asetpts=N/SR/TB",
-        terms.join("+")
+        "{};{}concat=n={}:v=0:a=1[out]",
+        cuts.join(";"),
+        inputs,
+        spans.len()
     )
 }
 
@@ -481,7 +493,7 @@ size= 1kB time=00:00:30.00
         assert_eq!(to_segment_ms(&spans, 9_999), 11_000, "越界取最后一段的末尾");
         assert_eq!(
             select_filter(&spans),
-            "asetnsamples=n=160:p=0,aselect=between(n\\,100\\,299)+between(n\\,1000\\,1099),asetpts=N/SR/TB"
+            "[0:a]atrim=start=1.000:end=3.000,asetpts=PTS-STARTPTS[a0];[0:a]atrim=start=10.000:end=11.000,asetpts=PTS-STARTPTS[a1];[a0][a1]concat=n=2:v=0:a=1[out]"
         );
     }
 
